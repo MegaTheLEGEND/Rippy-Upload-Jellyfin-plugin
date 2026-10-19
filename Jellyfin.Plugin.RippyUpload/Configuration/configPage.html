@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Rippy Upload</title>
+</head>
+<body>
+<div id="RippyUploadConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+        <div class="content-primary">
+            <form id="RippyUploadForm">
+                <div class="verticalSection">
+                    <h2 class="sectionTitle">Rippy Upload</h2>
+                </div>
+
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="RippyDestinationPath">Upload destination directory</label>
+                    <input id="RippyDestinationPath" type="text" is="emby-input" />
+                    <div class="fieldDescription">Absolute path on the Jellyfin server (for example /media/rippy). It must be writable by the Jellyfin service and should be inside a library folder. Uploads are rejected until this is set.</div>
+                </div>
+
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="RippyMaxFileSize">Maximum file size (MB)</label>
+                    <input id="RippyMaxFileSize" type="number" is="emby-input" min="0" step="1" />
+                    <div class="fieldDescription">Largest single upload accepted. 0 means no limit.</div>
+                </div>
+
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="RippyUserQuota">Per-user quota in the upload directory (MB)</label>
+                    <input id="RippyUserQuota" type="number" is="emby-input" min="0" step="1" />
+                    <div class="fieldDescription">Most data one user may have in the upload directory at once. Files you move out or delete stop counting. 0 means no limit.</div>
+                </div>
+
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="RippyMaxConcurrent">Maximum concurrent uploads</label>
+                    <input id="RippyMaxConcurrent" type="number" is="emby-input" min="1" step="1" />
+                    <div class="fieldDescription">Additional uploads beyond this number receive HTTP 429.</div>
+                </div>
+
+                <div class="verticalSection">
+                    <h3 class="sectionTitle">Allow video uploads</h3>
+                    <div class="fieldDescription">Only the users checked below may upload. Nobody is allowed by default, including administrators.</div>
+                    <div id="RippyUserList" style="margin-top: 1em;"></div>
+                </div>
+
+                <div>
+                    <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                        <span>Save</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        (function () {
+            var pluginId = '7b2f3c1e-5a4d-4e8b-9c6a-2d1f8e0b3a97';
+            var page = document.querySelector('#RippyUploadConfigPage');
+
+            function normalizeId(id) {
+                return String(id).replace(/-/g, '').toLowerCase();
+            }
+
+            function escapeHtml(text) {
+                return String(text).replace(/[&<>"']/g, function (c) {
+                    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+                });
+            }
+
+            function formatBytes(bytes) {
+                if (bytes >= 1073741824) { return (bytes / 1073741824).toFixed(2) + ' GB'; }
+                return Math.round(bytes / 1048576) + ' MB';
+            }
+
+            function renderUsers(users, allowed, usage) {
+                var usedById = {};
+                (usage || []).forEach(function (u) { usedById[normalizeId(u.userId)] = u.usedBytes; });
+                var allowedSet = {};
+                (allowed || []).forEach(function (id) { allowedSet[normalizeId(id)] = true; });
+
+                users.sort(function (a, b) { return a.Name.localeCompare(b.Name); });
+
+                var html = users.map(function (user) {
+                    var id = normalizeId(user.Id);
+                    var usedText = usedById[id] ? ' - ' + formatBytes(usedById[id]) + ' in upload directory' : '';
+                    var checked = allowedSet[id] ? ' checked' : '';
+                    var suffix = user.Policy && user.Policy.IsAdministrator ? ' (administrator)' : '';
+                    return '<div><label class="emby-checkbox-label">' +
+                        '<input is="emby-checkbox" type="checkbox" class="rippyUserCheckbox" data-userid="' + escapeHtml(id) + '"' + checked + ' />' +
+                        '<span>' + escapeHtml(user.Name + suffix + usedText) + '</span></label></div>';
+                }).join('');
+
+                page.querySelector('#RippyUserList').innerHTML = html || '<div class="fieldDescription">No users found.</div>';
+            }
+
+            page.addEventListener('pageshow', function () {
+                Dashboard.showLoadingMsg();
+                Promise.all([
+                    ApiClient.getPluginConfiguration(pluginId),
+                    ApiClient.getUsers(),
+                    ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('Rippy/Usage'), dataType: 'json' }).catch(function () { return []; })
+                ]).then(function (results) {
+                    var config = results[0];
+                    page.querySelector('#RippyDestinationPath').value = config.DestinationPath || '';
+                    page.querySelector('#RippyMaxFileSize').value = config.MaxFileSizeMegabytes;
+                    page.querySelector('#RippyMaxConcurrent').value = config.MaxConcurrentUploads;
+                    page.querySelector('#RippyUserQuota').value = config.UserQuotaMegabytes;
+                    renderUsers(results[1], config.AllowedUserIds, results[2]);
+                    Dashboard.hideLoadingMsg();
+                }).catch(function () {
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert('Could not load the Rippy Upload settings.');
+                });
+            });
+
+            page.querySelector('#RippyUploadForm').addEventListener('submit', function (e) {
+                e.preventDefault();
+                Dashboard.showLoadingMsg();
+
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    var maxSize = parseInt(page.querySelector('#RippyMaxFileSize').value, 10);
+                    var maxConcurrent = parseInt(page.querySelector('#RippyMaxConcurrent').value, 10);
+                    var quota = parseInt(page.querySelector('#RippyUserQuota').value, 10);
+
+                    config.DestinationPath = page.querySelector('#RippyDestinationPath').value.trim();
+                    config.MaxFileSizeMegabytes = isNaN(maxSize) || maxSize < 0 ? 0 : maxSize;
+                    config.UserQuotaMegabytes = isNaN(quota) || quota < 0 ? 0 : quota;
+                    config.MaxConcurrentUploads = isNaN(maxConcurrent) || maxConcurrent < 1 ? 1 : maxConcurrent;
+                    config.AllowedUserIds = Array.prototype.map.call(
+                        page.querySelectorAll('.rippyUserCheckbox:checked'),
+                        function (box) { return box.getAttribute('data-userid'); });
+
+                    return ApiClient.updatePluginConfiguration(pluginId, config);
+                }).then(function (result) {
+                    Dashboard.processPluginConfigurationUpdateResult(result);
+                }).catch(function () {
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert('Could not save the Rippy Upload settings.');
+                });
+
+                return false;
+            });
+        })();
+    </script>
+</div>
+</body>
+</html>

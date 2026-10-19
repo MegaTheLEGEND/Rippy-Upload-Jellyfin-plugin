@@ -1,0 +1,13 @@
+{
+  "guid": "7b2f3c1e-5a4d-4e8b-9c6a-2d1f8e0b3a97",
+  "name": "Rippy Upload",
+  "description": "Receives MP4/MKV video uploads from Rippy for users who have been granted upload permission.",
+  "overview": "Authenticated, per-user authorized video upload endpoint for Rippy.",
+  "owner": "MegaTheLEGEND",
+  "category": "General",
+  "version": "1.0.0.0",
+  "targetAbi": "10.11.0.0",
+  "timestamp": "2026-10-19T00:00:00Z",
+  "status": "Active",
+  "autoUpdate": false
+}
