@@ -88,8 +88,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add meta.json "$PROJECT/$PROJECT.csproj"
           git commit -m "Release ${{ steps.ver.outputs.tag }}" || echo "No version changes to commit"
-          git tag "${{ steps.ver.outputs.tag }}"
-          git push origin HEAD --follow-tags
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+          git push origin HEAD
+          git push origin "refs/tags/${{ steps.ver.outputs.tag }}"
 
       - name: Create GitHub release
         env:
