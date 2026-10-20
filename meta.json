@@ -5,9 +5,9 @@
   "overview": "Authenticated, per-user authorized video upload endpoint for Rippy.",
   "owner": "MegaTheLEGEND",
   "category": "General",
-  "version": "1.0.1.0",
+  "version": "1.0.2.0",
   "targetAbi": "10.11.0.0",
-  "timestamp": "2026-10-20T00:27:26Z",
+  "timestamp": "2026-10-20T02:36:18Z",
   "status": "Active",
   "autoUpdate": false
 }
