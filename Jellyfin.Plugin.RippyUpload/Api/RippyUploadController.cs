@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.RippyUpload.Configuration;
 using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -29,6 +30,7 @@ public class RippyUploadController : ControllerBase
     private const int HeaderLength = 12;
     private const int MaxFolderDepth = 4;
     private const int MaxListEntries = 10000;
+    private const long MaxChunkBytes = 64L * 1024 * 1024;
     private const string UserIdClaim = "Jellyfin-UserId";
     private const string IncomingDirectoryName = ".rippy-incoming";
 
@@ -44,6 +46,7 @@ public class RippyUploadController : ControllerBase
     private static readonly SemaphoreSlim ScanLock = new SemaphoreSlim(1, 1);
     private static int _scanPending;
     private static int _activeUploads;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ChunkSession> ChunkSessions = new System.Collections.Concurrent.ConcurrentDictionary<string, ChunkSession>();
 
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger<RippyUploadController> _logger;
@@ -78,7 +81,9 @@ public class RippyUploadController : ControllerBase
             MaxFileSizeBytes = config is null || config.MaxFileSizeMegabytes <= 0 ? 0 : (long)config.MaxFileSizeMegabytes * 1024 * 1024,
             AllowedExtensions = AllowedExtensions,
             UsedBytes = destination is null || userId == Guid.Empty || Plugin.Instance is null ? 0 : Plugin.Instance.Usage.GetUsage(userId, destination),
-            QuotaBytes = config is null || config.UserQuotaMegabytes <= 0 ? 0 : (long)config.UserQuotaMegabytes * 1024 * 1024
+            QuotaBytes = config is null || config.UserQuotaMegabytes <= 0 ? 0 : (long)config.UserQuotaMegabytes * 1024 * 1024,
+            Chunked = true,
+            MaxChunkBytes = MaxChunkBytes
         };
     }
 
@@ -370,6 +375,534 @@ public class RippyUploadController : ControllerBase
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Reports how many bytes of a chunked upload the server already holds, so an interrupted upload can resume.
+    /// </summary>
+    /// <param name="uploadId">The client-chosen upload id (32 hex characters).</param>
+    /// <returns>The received byte count (0 if nothing is stored yet).</returns>
+    [HttpGet("Upload/Progress")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public IActionResult GetChunkProgress([FromQuery] string? uploadId)
+    {
+        var denied = CheckChunkCaller(uploadId, out var userId, out var destination, out _);
+        if (denied is not null)
+        {
+            return denied;
+        }
+
+        var partPath = ChunkPartPath(destination, userId, uploadId!);
+        long received = System.IO.File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+        return Ok(new ChunkResponse { Status = "ok", Received = received });
+    }
+
+    /// <summary>
+    /// Appends one chunk of a large upload. Chunks must arrive in order; each is a separate small request so
+    /// proxies with per-request body limits (for example Cloudflare's 100 MB) are not a problem.
+    /// </summary>
+    /// <param name="uploadId">The client-chosen upload id (32 hex characters).</param>
+    /// <param name="offset">Where this chunk starts in the file.</param>
+    /// <param name="total">The size of the whole file.</param>
+    /// <param name="cancellationToken">Cancellation token tied to the request.</param>
+    /// <returns>The number of bytes now stored, or 409 with the stored count if the offset does not match.</returns>
+    [HttpPost("Upload/Chunk")]
+    [Consumes("application/octet-stream")]
+    [DisableRequestSizeLimit]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<IActionResult> UploadChunk([FromQuery] string? uploadId, [FromQuery] long offset, [FromQuery] long total, CancellationToken cancellationToken)
+    {
+        var denied = CheckChunkCaller(uploadId, out var userId, out var destination, out var config);
+        if (denied is not null)
+        {
+            return denied;
+        }
+
+        var maxBytes = config.MaxFileSizeMegabytes > 0 ? (long)config.MaxFileSizeMegabytes * 1024 * 1024 : long.MaxValue;
+        if (total <= 0 || offset < 0 || offset >= total)
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_range", "offset and total must describe a position inside the file.");
+        }
+
+        if (total > maxBytes)
+        {
+            return Error(StatusCodes.Status413PayloadTooLarge, "too_large", "The file exceeds the configured maximum upload size.");
+        }
+
+        var length = Request.ContentLength;
+        if (!length.HasValue || length.Value <= 0 || length.Value > MaxChunkBytes)
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_chunk", "A chunk needs a Content-Length between 1 byte and " + (MaxChunkBytes / 1048576) + " MB.");
+        }
+
+        if (offset + length.Value > total)
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_range", "The chunk runs past the end of the file.");
+        }
+
+        var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
+        var usageLedger = Plugin.Instance!.Usage;
+        if (offset == 0 && quotaBytes > 0)
+        {
+            // Non-binding early check so a doomed upload is refused before any data is sent.
+            if (!usageLedger.TryReserve(userId, destination, quotaBytes, total, out _, out var probeReserved, out var probeUsed))
+            {
+                return Error(
+                    StatusCodes.Status507InsufficientStorage,
+                    "quota_exceeded",
+                    "Upload quota exceeded: " + (probeUsed / 1048576) + " MB of " + config.UserQuotaMegabytes + " MB is in use. Ask an administrator to move or remove your files.");
+            }
+
+            usageLedger.Release(userId, probeReserved);
+        }
+
+        var buffer = new byte[(int)length.Value];
+        var filled = 0;
+        try
+        {
+            while (filled < buffer.Length)
+            {
+                var read = await Request.Body.ReadAsync(buffer.AsMemory(filled, buffer.Length - filled), cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                filled += read;
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or BadHttpRequestException or IOException)
+        {
+            return Error(StatusCodes.Status400BadRequest, "aborted", "The chunk could not be read completely.");
+        }
+
+        if (filled != buffer.Length)
+        {
+            return Error(StatusCodes.Status400BadRequest, "incomplete", "The received chunk size does not match Content-Length.");
+        }
+
+        var key = ChunkKey(userId, uploadId!);
+        PruneChunkSessions();
+        var session = ChunkSessions.GetOrAdd(key, _ => new ChunkSession());
+        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var incomingDirectory = Path.Combine(destination, IncomingDirectoryName);
+            Directory.CreateDirectory(incomingDirectory);
+            if (offset == 0)
+            {
+                CleanStaleParts(incomingDirectory);
+            }
+
+            var partPath = ChunkPartPath(destination, userId, uploadId!);
+            var stored = System.IO.File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+
+            if (offset == 0 && stored > 0)
+            {
+                // A fresh start for this id: drop whatever an earlier attempt left behind.
+                System.IO.File.Delete(partPath);
+                stored = 0;
+                session.ResetHash();
+            }
+
+            if (stored != offset)
+            {
+                return StatusCode(StatusCodes.Status409Conflict, new ChunkResponse { Status = "offset_mismatch", Received = stored });
+            }
+
+            if (stored == 0)
+            {
+                if (!HeaderMatchesAny(buffer))
+                {
+                    return Error(StatusCodes.Status400BadRequest, "invalid_content", "The file content does not look like a valid .mp4 or .mkv file.");
+                }
+            }
+
+            if (session.Hash is null || session.Length != stored)
+            {
+                await session.RebuildHashAsync(partPath, stored, cancellationToken).ConfigureAwait(false);
+            }
+
+            var streamOptions = new FileStreamOptions
+            {
+                Mode = stored == 0 ? FileMode.CreateNew : FileMode.Append,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                BufferSize = BufferSize,
+                Options = FileOptions.Asynchronous
+            };
+            if (stored == 0 && !OperatingSystem.IsWindows())
+            {
+                streamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
+            }
+
+            session.Length = -1;
+            using (var fs = new FileStream(partPath, streamOptions))
+            {
+                await fs.WriteAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+                await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            session.Hash!.AppendData(buffer, 0, buffer.Length);
+            session.Length = stored + buffer.Length;
+            session.LastUsedUtc = DateTime.UtcNow;
+            return Ok(new ChunkResponse { Status = "ok", Received = session.Length });
+        }
+        catch (OperationCanceledException)
+        {
+            session.Length = -1;
+            return Error(StatusCodes.Status400BadRequest, "aborted", "The upload was cancelled before the chunk was stored.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            session.Length = -1;
+            _logger.LogError(ex, "Rippy chunk upload failed while writing {UploadId}", uploadId);
+            return Error(StatusCodes.Status500InternalServerError, "storage_error", "The chunk could not be written to the upload directory.");
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Finishes a chunked upload: checks size, content and SHA-256, then moves the file into place.
+    /// </summary>
+    /// <param name="uploadId">The client-chosen upload id (32 hex characters).</param>
+    /// <param name="filename">The target file name (must end in .mp4 or .mkv).</param>
+    /// <param name="folder">Optional relative sub-folder inside the upload directory.</param>
+    /// <param name="total">The size of the whole file.</param>
+    /// <param name="cancellationToken">Cancellation token tied to the request.</param>
+    /// <returns>The result of the upload.</returns>
+    [HttpPost("Upload/Complete")]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    public async Task<IActionResult> CompleteChunkedUpload([FromQuery] string? uploadId, [FromQuery] string? filename, [FromQuery] string? folder, [FromQuery] long total, CancellationToken cancellationToken)
+    {
+        var denied = CheckChunkCaller(uploadId, out var userId, out var destination, out var config);
+        if (denied is not null)
+        {
+            return denied;
+        }
+
+        if (!TryValidateName(filename, true, out var fileName, out var extension, out var nameError))
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_filename", nameError);
+        }
+
+        if (!TryValidateFolder(folder, out var folderSegments, out var folderError))
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_folder", folderError);
+        }
+
+        var expectedSha = Request.Headers["X-Content-SHA256"].ToString().Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(expectedSha))
+        {
+            return Error(StatusCodes.Status400BadRequest, "missing_checksum", "The X-Content-SHA256 header is required.");
+        }
+
+        if (expectedSha.Length != 64 || !expectedSha.All(Uri.IsHexDigit))
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_checksum", "X-Content-SHA256 must be 64 hexadecimal characters.");
+        }
+
+        string finalPath;
+        try
+        {
+            Directory.CreateDirectory(destination);
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            if (!TryResolveDirectory(destination, folderSegments, out var targetDirectory))
+            {
+                return Error(StatusCodes.Status400BadRequest, "invalid_folder", "The folder resolves outside the upload directory.");
+            }
+
+            finalPath = Path.Combine(targetDirectory, fileName);
+            var parent = Path.TrimEndingDirectorySeparator(Path.GetDirectoryName(Path.GetFullPath(finalPath)) ?? string.Empty);
+            if (!string.Equals(parent, targetDirectory, comparison))
+            {
+                return Error(StatusCodes.Status400BadRequest, "invalid_filename", "The file name resolves outside the upload directory.");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogError(ex, "Rippy upload: destination directory is not usable");
+            return Error(StatusCodes.Status500InternalServerError, "storage_error", "The upload directory is not accessible to Jellyfin.");
+        }
+
+        if (System.IO.File.Exists(finalPath))
+        {
+            return Error(StatusCodes.Status409Conflict, "exists", "A file with this name already exists.");
+        }
+
+        var key = ChunkKey(userId, uploadId!);
+        var partPath = ChunkPartPath(destination, userId, uploadId!);
+        if (!System.IO.File.Exists(partPath))
+        {
+            return Error(StatusCodes.Status404NotFound, "no_upload", "No chunked upload with this id is in progress.");
+        }
+
+        var session = ChunkSessions.GetOrAdd(key, _ => new ChunkSession());
+        await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var usage = Plugin.Instance!.Usage;
+        long reservedBytes = 0;
+        var moved = false;
+        try
+        {
+            var stored = new FileInfo(partPath).Length;
+            if (stored != total)
+            {
+                return StatusCode(StatusCodes.Status409Conflict, new ChunkResponse { Status = "offset_mismatch", Received = stored });
+            }
+
+            var header = new byte[HeaderLength];
+            using (var probe = new FileStream(partPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var got = 0;
+                while (got < HeaderLength)
+                {
+                    var read = await probe.ReadAsync(header.AsMemory(got, HeaderLength - got), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    got += read;
+                }
+
+                if (got < HeaderLength || !HeaderMatches(extension, header))
+                {
+                    return Error(StatusCodes.Status400BadRequest, "invalid_content", "The file content does not look like a valid " + extension + " file.");
+                }
+            }
+
+            if (session.Hash is null || session.Length != stored)
+            {
+                await session.RebuildHashAsync(partPath, stored, cancellationToken).ConfigureAwait(false);
+            }
+
+            var sha = Convert.ToHexString(session.Hash!.GetHashAndReset()).ToLowerInvariant();
+            session.Length = -1;
+            if (!string.Equals(expectedSha, sha, StringComparison.Ordinal))
+            {
+                DeletePart(partPath);
+                CloseChunkSession(key);
+                return Error(StatusCodes.Status422UnprocessableEntity, "checksum_mismatch", "The SHA-256 of the received data does not match X-Content-SHA256.");
+            }
+
+            var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
+            if (!usage.TryReserve(userId, destination, quotaBytes, stored, out _, out reservedBytes, out var usedBytes))
+            {
+                return Error(
+                    StatusCodes.Status507InsufficientStorage,
+                    "quota_exceeded",
+                    "Upload quota exceeded: " + (usedBytes / 1048576) + " MB of " + config.UserQuotaMegabytes + " MB is in use. Ask an administrator to move or remove your files.");
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+            try
+            {
+                System.IO.File.Move(partPath, finalPath, false);
+                moved = true;
+            }
+            catch (IOException) when (System.IO.File.Exists(finalPath))
+            {
+                return Error(StatusCodes.Status409Conflict, "exists", "A file with this name already exists.");
+            }
+
+            if (!usage.Record(userId, string.Join('/', folderSegments.Append(fileName)), stored))
+            {
+                _logger.LogWarning("Rippy upload usage ledger could not be saved to disk; quota is tracked in memory until restart");
+            }
+
+            _logger.LogInformation("Rippy chunked upload complete: {FileName} ({Size} bytes) from user {UserId}", fileName, stored, userId);
+            QueueLibraryScan();
+            CloseChunkSession(key);
+
+            return StatusCode(StatusCodes.Status201Created, new UploadResponse
+            {
+                Status = "ok",
+                Filename = fileName,
+                Folder = string.Join('/', folderSegments),
+                Size = stored,
+                Sha256 = sha
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            session.Length = -1;
+            return Error(StatusCodes.Status400BadRequest, "aborted", "The request was cancelled before the upload was finished.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            session.Length = -1;
+            _logger.LogError(ex, "Rippy chunked upload failed while finishing {FileName}", fileName);
+            return Error(StatusCodes.Status500InternalServerError, "storage_error", "The file could not be written to the upload directory.");
+        }
+        finally
+        {
+            if (reservedBytes > 0)
+            {
+                usage.Release(userId, reservedBytes);
+            }
+
+            session.Gate.Release();
+            if (moved)
+            {
+                ChunkSessions.TryRemove(key, out _);
+            }
+        }
+    }
+
+    private IActionResult? CheckChunkCaller(string? uploadId, out Guid userId, out string destination, out PluginConfiguration config)
+    {
+        userId = Guid.Empty;
+        destination = string.Empty;
+        config = null!;
+
+        var current = Plugin.Instance?.Configuration;
+        if (current is null)
+        {
+            return Error(StatusCodes.Status503ServiceUnavailable, "not_configured", "Plugin is not initialized.");
+        }
+
+        config = current;
+        userId = GetUserId();
+        if (userId == Guid.Empty)
+        {
+            return Error(StatusCodes.Status401Unauthorized, "unauthenticated", "A Jellyfin user session token is required. API keys are not accepted.");
+        }
+
+        if (!config.AllowedUserIds.Contains(userId))
+        {
+            _logger.LogWarning("Rippy upload rejected: user {UserId} is not permitted to upload", userId);
+            return Error(StatusCodes.Status403Forbidden, "forbidden", "This user is not allowed to upload videos.");
+        }
+
+        var resolved = ResolveDestination(config.DestinationPath);
+        if (resolved is null)
+        {
+            return Error(StatusCodes.Status503ServiceUnavailable, "not_configured", "The upload destination has not been configured by an administrator.");
+        }
+
+        destination = resolved;
+        if (string.IsNullOrEmpty(uploadId) || uploadId.Length != 32 || !uploadId.All(Uri.IsHexDigit))
+        {
+            return Error(StatusCodes.Status400BadRequest, "invalid_upload_id", "uploadId must be 32 hexadecimal characters.");
+        }
+
+        return null;
+    }
+
+    private static string ChunkKey(Guid userId, string uploadId)
+    {
+        return userId.ToString("N") + "-" + uploadId.ToLowerInvariant();
+    }
+
+    private static string ChunkPartPath(string destination, Guid userId, string uploadId)
+    {
+        return Path.Combine(destination, IncomingDirectoryName, ChunkKey(userId, uploadId) + ".part");
+    }
+
+    private static bool HeaderMatchesAny(byte[] firstChunk)
+    {
+        if (firstChunk.Length < HeaderLength)
+        {
+            return false;
+        }
+
+        return HeaderMatches(".mkv", firstChunk) || HeaderMatches(".mp4", firstChunk);
+    }
+
+    private static void CloseChunkSession(string key)
+    {
+        if (ChunkSessions.TryRemove(key, out var session))
+        {
+            session.Dispose();
+        }
+    }
+
+    private static void PruneChunkSessions()
+    {
+        foreach (var pair in ChunkSessions)
+        {
+            if (DateTime.UtcNow - pair.Value.LastUsedUtc > TimeSpan.FromDays(1) && pair.Value.Gate.CurrentCount > 0)
+            {
+                CloseChunkSession(pair.Key);
+            }
+        }
+    }
+
+    private void DeletePart(string path)
+    {
+        try
+        {
+            System.IO.File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not delete incomplete upload {TempPath}", path);
+        }
+    }
+
+    private sealed class ChunkSession : IDisposable
+    {
+        public SemaphoreSlim Gate { get; } = new SemaphoreSlim(1, 1);
+
+        public IncrementalHash? Hash { get; set; }
+
+        public long Length { get; set; } = -1;
+
+        public DateTime LastUsedUtc { get; set; } = DateTime.UtcNow;
+
+        public void ResetHash()
+        {
+            Hash?.Dispose();
+            Hash = null;
+            Length = -1;
+        }
+
+        public async Task RebuildHashAsync(string path, long count, CancellationToken cancellationToken)
+        {
+            ResetHash();
+            var fresh = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            if (count > 0)
+            {
+                var buffer = new byte[BufferSize];
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                long remaining = count;
+                while (remaining > 0)
+                {
+                    var read = await fs.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    fresh.AppendData(buffer, 0, read);
+                    remaining -= read;
+                }
+            }
+
+            Hash = fresh;
+            Length = count;
+        }
+
+        public void Dispose()
+        {
+            Hash?.Dispose();
+            Hash = null;
+        }
+    }
+
+    /// <summary>Chunk response body.</summary>
+    public sealed class ChunkResponse
+    {
+        /// <summary>Gets or sets the status ("ok" or "offset_mismatch").</summary>
+        [JsonPropertyName("status")]
+        public string Status { get; set; } = string.Empty;
+
+        /// <summary>Gets or sets how many bytes of the upload the server holds.</summary>
+        [JsonPropertyName("received")]
+        public long Received { get; set; }
     }
 
     private static bool TryResolveDirectory(string destination, string[] segments, out string directory)
@@ -815,6 +1348,14 @@ public class RippyUploadController : ControllerBase
         /// <summary>Gets or sets the per-user quota in bytes (0 = unlimited).</summary>
         [JsonPropertyName("quotaBytes")]
         public long QuotaBytes { get; set; }
+
+        /// <summary>Gets or sets a value indicating whether chunked uploads (Upload/Chunk, Upload/Complete) are supported.</summary>
+        [JsonPropertyName("chunked")]
+        public bool Chunked { get; set; }
+
+        /// <summary>Gets or sets the largest single chunk in bytes.</summary>
+        [JsonPropertyName("maxChunkBytes")]
+        public long MaxChunkBytes { get; set; }
 
         /// <summary>Gets or sets the accepted file extensions.</summary>
         [JsonPropertyName("allowedExtensions")]

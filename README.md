@@ -87,6 +87,17 @@ The server takes the user identity from the authenticated session, then checks i
 
 A library scan is queued after each successful upload; bursts of uploads are coalesced.
 
+### Chunked upload (for proxies that cap request size, e.g. Cloudflare's 100 MB)
+
+`GET /Status` reports `"chunked": true` and `maxChunkBytes`. A client then sends the file in order as small requests instead of one big one. Same authentication and permissions as `POST /Upload`.
+
+1. `GET /Rippy/Upload/Progress?uploadId=<32 hex>` returns `{"received": N}`, how many bytes the server already holds (0 if none), so an interrupted upload can resume.
+2. `POST /Rippy/Upload/Chunk?uploadId=<32 hex>&offset=<N>&total=<file size>` with the raw bytes as an `application/octet-stream` body (at most 64 MB). Returns `200 {"received": N}`. If `offset` is not where the server is, it answers `409 {"status": "offset_mismatch", "received": N}` and the client continues from `N`.
+3. `POST /Rippy/Upload/Complete?uploadId=<32 hex>&filename=<name>&total=<file size>[&folder=<path>]` with the `X-Content-SHA256` header. The server checks size, content and the SHA-256 (computed while the chunks arrived) and files the video exactly like `POST /Upload`: `201` on success, `409 exists`, `422 checksum_mismatch`, `507 quota_exceeded`, and so on.
+
+Chunks are stored as `<destination>/.rippy-incoming/<user>-<uploadId>.part`; abandoned ones are deleted after a day. The upload id is chosen by the client (Rippy uses the first 32 characters of the file's SHA-256, so retrying the same file resumes).
+
+
 ### `GET /Rippy/List?folder=<relative/path>[&recursive=true]`
 
 Lets Rippy see what has already been uploaded, so it can skip duplicates and continue TV episode numbering. Same authentication and the same permission as uploading (401/403 otherwise). `folder` follows the upload rules; omit it for the destination root. Only `.mp4`/`.mkv` files are listed; hidden entries, `.part` files, and symlinks are skipped. Returns at most 10000 entries (`truncated: true` if cut off).
