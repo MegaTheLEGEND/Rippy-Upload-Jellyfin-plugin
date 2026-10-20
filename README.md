@@ -10,7 +10,7 @@ Targets Jellyfin **10.11.x** (.NET 9). For another server version, edit `Jellyfi
 dotnet publish Jellyfin.Plugin.RippyUpload -c Release -o out
 ```
 
-Copy `out/Jellyfin.Plugin.RippyUpload.dll` and `meta.json` into a new folder in the Jellyfin plugins directory, for example `<jellyfin-data>/plugins/RippyUpload_1.0.0.0/`, then restart Jellyfin.
+Copy `out/Jellyfin.Plugin.RippyUpload.dll` and `meta.json` into a new folder in the Jellyfin plugins directory, for example `<jellyfin-data>/plugins/RippyUpload_1.0.1.0/`, then restart Jellyfin.
 
 ## Configuration
 
@@ -207,6 +207,7 @@ Set the plugin's destination to the root Rippy would use on the NAS. Trailing do
 
 ## Notes
 
+- Authorization uses plain `[Authorize]` (Jellyfin's own token authentication) plus an `Administrator` role check on `/Rippy/Usage`, not Jellyfin's named policies, because newer Jellyfin versions no longer have a policy called `DefaultAuthorization` (every request failed with HTTP 500).
 - Behind a reverse proxy, allow large bodies and disable request buffering (nginx: `client_max_body_size 0; proxy_request_buffering off;`).
 - Removing a user's checkbox takes effect on their next request; deleting a user invalidates their tokens.
 - This plugin has not been built or tested by its author in this repository snapshot; build and verify it against your server version.

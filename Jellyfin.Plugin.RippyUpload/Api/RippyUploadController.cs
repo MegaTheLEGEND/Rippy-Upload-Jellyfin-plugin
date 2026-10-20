@@ -21,7 +21,7 @@ namespace Jellyfin.Plugin.RippyUpload.Api;
 /// </summary>
 [ApiController]
 [Route("Rippy")]
-[Authorize(Policy = "DefaultAuthorization")]
+[Authorize]
 [Produces("application/json")]
 public class RippyUploadController : ControllerBase
 {
@@ -410,7 +410,7 @@ public class RippyUploadController : ControllerBase
     /// </summary>
     /// <returns>Usage per user.</returns>
     [HttpGet("Usage")]
-    [Authorize(Policy = "RequiresElevation")]
+    [Authorize(Roles = "Administrator")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     public ActionResult<List<UserUsage>> GetUsage()
     {
