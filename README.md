@@ -1,3 +1,9 @@
+# Notice for humans from a human:
+
+I directed an AI agent to create this software. I like to disclose when i make something using AI, this is one of those things. This is a plugin for jellyfin that allows you to upload movies and TV shows to the server using the [Rippy](https://github.com/MegaTheLEGEND/Rippy) app. It authenticates with your username and password to your account in jellyfin. And privileges are toggled on and off per user in the config page.
+
+
+
 # Rippy Upload (Jellyfin plugin)
 
 Receives MP4/MKV uploads from [Rippy](https://github.com/MegaTheLEGEND/Rippy) and saves them to an administrator-configured directory, then refreshes the Jellyfin library. Only Jellyfin users the administrator has explicitly allowed can upload.
