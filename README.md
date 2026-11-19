@@ -21,7 +21,7 @@ Dashboard → Plugins → **Rippy Upload** (also in the Dashboard sidebar):
 | Upload destination directory | Absolute path, writable by the Jellyfin service, ideally inside a library folder. Created if missing. Uploads fail with 503 until set. |
 | Maximum file size (MB) | Per-upload limit. `0` = unlimited. Default 10240 (10 GB). |
 | Per-user quota (MB) | Most data one user may have in the upload directory at once. Default 10240 (10 GB), `0` = unlimited. See "Per-user quota" below. |
-| Maximum concurrent uploads | Extra uploads get HTTP 429. Default 2. |
+| Maximum concurrent uploads | Upload requests (whole uploads and individual chunks) handled at once. Extra ones get HTTP 429. Default 2. |
 | Allow video uploads | One checkbox per Jellyfin user. Off for everyone by default, administrators included. |
 
 Jellyfin has no official plugin extension point for adding fields to its native Users > user pages, so permissions are managed on this plugin page. They are stored by Jellyfin user ID in the plugin configuration file and persist across restarts.
@@ -31,7 +31,7 @@ Jellyfin has no official plugin extension point for adding fields to its native 
 Intended workflow: users upload into the destination (a review/limbo folder, including `_Needs Review` and its subfolders), and an administrator later moves finished files into the main libraries.
 
 - The plugin records which user uploaded each file (`RippyUpload.usage.json` in Jellyfin's plugin configuration folder). A user's usage is the total size of their uploaded files that are **still in the destination**. Moving or deleting a file (or changing it so its size differs) frees that space automatically.
-- Uploads that would push a user past the quota get `507` `quota_exceeded`. Space for in-progress uploads is reserved up front, so parallel uploads cannot overshoot.
+- Uploads that would push a user past the quota get `507` `quota_exceeded`. Space for in-progress uploads is reserved up front, so parallel uploads cannot overshoot. Unfinished chunked uploads count toward the quota too.
 - Usage is shown next to each user on the plugin page. Users can read their own numbers from `GET /Rippy/Status`.
 - Only files uploaded after this plugin was installed are attributed. Renaming a file inside the destination also frees its quota. If the destination folder is unavailable (for example an unmounted drive), nothing is pruned.
 
@@ -80,7 +80,8 @@ The server takes the user identity from the authenticated session, then checks i
 | 413 | `too_large` | Exceeds the configured limit |
 | 415 | n/a | Unsupported Content-Type |
 | 422 | `checksum_mismatch` | SHA-256 differs from `X-Content-SHA256` |
-| 429 | `busy` | Concurrent upload limit reached (`Retry-After: 30`) |
+| 429 | `busy` | Concurrent upload limit reached (`Retry-After: 30`, or `5` for a chunk) |
+| 429 | `too_many_pending` | Starting a chunked upload while the user already has 4 unfinished ones (`Retry-After: 60`) |
 | 507 | `quota_exceeded` | The user's quota in the upload directory would be exceeded |
 | 500 | `storage_error` | Destination not writable or write failed |
 | 503 | `not_configured` | Destination not set or not an absolute path |
@@ -95,7 +96,7 @@ A library scan is queued after each successful upload; bursts of uploads are coa
 2. `POST /Rippy/Upload/Chunk?uploadId=<32 hex>&offset=<N>&total=<file size>` with the raw bytes as an `application/octet-stream` body (at most 64 MB). Returns `200 {"received": N}`. If `offset` is not where the server is, it answers `409 {"status": "offset_mismatch", "received": N}` and the client continues from `N`.
 3. `POST /Rippy/Upload/Complete?uploadId=<32 hex>&filename=<name>&total=<file size>[&folder=<path>]` with the `X-Content-SHA256` header. The server checks size, content and the SHA-256 (computed while the chunks arrived) and files the video exactly like `POST /Upload`: `201` on success, `409 exists`, `422 checksum_mismatch`, `507 quota_exceeded`, and so on.
 
-Chunks are stored as `<destination>/.rippy-incoming/<user>-<uploadId>.part`; abandoned ones are deleted after a day. The upload id is chosen by the client (Rippy uses the first 32 characters of the file's SHA-256, so retrying the same file resumes).
+Chunks are stored as `<destination>/.rippy-incoming/<user>-<uploadId>.part`; abandoned ones are deleted after a day. Each user may have at most 4 unfinished chunked uploads at once, and their stored bytes count toward the user's quota. Every chunk request counts against **Maximum concurrent uploads** (a chunk is held in memory, up to 64 MB, before it is written). The upload id is chosen by the client (Rippy uses the first 32 characters of the file's SHA-256, so retrying the same file resumes).
 
 
 ### `GET /Rippy/List?folder=<relative/path>[&recursive=true]`

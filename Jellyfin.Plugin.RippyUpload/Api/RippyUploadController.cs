@@ -31,6 +31,7 @@ public class RippyUploadController : ControllerBase
     private const int MaxFolderDepth = 4;
     private const int MaxListEntries = 10000;
     private const long MaxChunkBytes = 64L * 1024 * 1024;
+    private const int MaxPendingChunkedUploads = 4;
     private const string UserIdClaim = "Jellyfin-UserId";
     private const string IncomingDirectoryName = ".rippy-incoming";
 
@@ -204,7 +205,8 @@ public class RippyUploadController : ControllerBase
         try
         {
             var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
-            if (!usage.TryReserve(userId, destination, quotaBytes, Request.ContentLength, out var allowance, out reservedBytes, out var usedBytes))
+            var pendingBytes = quotaBytes > 0 ? PendingChunkBytes(incomingDirectory, userId, null, out _) : 0;
+            if (!usage.TryReserve(userId, destination, quotaBytes, Request.ContentLength, out var allowance, out reservedBytes, out var usedBytes, pendingBytes))
             {
                 return Error(
                     StatusCodes.Status507InsufficientStorage,
@@ -440,23 +442,58 @@ public class RippyUploadController : ControllerBase
             return Error(StatusCodes.Status400BadRequest, "invalid_range", "The chunk runs past the end of the file.");
         }
 
-        var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
-        var usageLedger = Plugin.Instance!.Usage;
-        if (offset == 0 && quotaBytes > 0)
+        // Each chunk is held in memory (up to MaxChunkBytes) before it is written, so chunks count against the
+        // same concurrent-upload limit as whole uploads. Memory use stays below MaxConcurrentUploads x 64 MB.
+        var limit = Math.Max(1, config.MaxConcurrentUploads);
+        if (Interlocked.Increment(ref _activeUploads) > limit)
         {
-            // Non-binding early check so a doomed upload is refused before any data is sent.
-            if (!usageLedger.TryReserve(userId, destination, quotaBytes, total, out _, out var probeReserved, out var probeUsed))
-            {
-                return Error(
-                    StatusCodes.Status507InsufficientStorage,
-                    "quota_exceeded",
-                    "Upload quota exceeded: " + (probeUsed / 1048576) + " MB of " + config.UserQuotaMegabytes + " MB is in use. Ask an administrator to move or remove your files.");
-            }
-
-            usageLedger.Release(userId, probeReserved);
+            Interlocked.Decrement(ref _activeUploads);
+            Response.Headers["Retry-After"] = "5";
+            return Error(StatusCodes.Status429TooManyRequests, "busy", "Too many uploads are in progress. Retry later.");
         }
 
-        var buffer = new byte[(int)length.Value];
+        try
+        {
+            return await ReceiveChunkAsync(uploadId!, userId, destination, config, offset, total, (int)length.Value, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeUploads);
+        }
+    }
+
+    private async Task<IActionResult> ReceiveChunkAsync(string uploadId, Guid userId, string destination, PluginConfiguration config, long offset, long total, int chunkLength, CancellationToken cancellationToken)
+    {
+        var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
+        var usageLedger = Plugin.Instance!.Usage;
+        if (offset == 0)
+        {
+            // Early checks so a doomed upload is refused before any data is sent. Unfinished uploads count:
+            // otherwise a user could start many and never finish them, filling the disk past the quota.
+            var incoming = Path.Combine(destination, IncomingDirectoryName);
+            CleanStaleParts(incoming);
+            var othersPending = PendingChunkBytes(incoming, userId, ChunkPartPath(destination, userId, uploadId), out var othersCount);
+            if (othersCount >= MaxPendingChunkedUploads)
+            {
+                Response.Headers["Retry-After"] = "60";
+                return Error(
+                    StatusCodes.Status429TooManyRequests,
+                    "too_many_pending",
+                    "You already have " + othersCount + " unfinished uploads. Finish or resume them first; abandoned ones are removed after a day.");
+            }
+
+            if (quotaBytes > 0)
+            {
+                if (!usageLedger.TryReservePending(userId, destination, quotaBytes, othersPending, total, out var probeReserved, out var probeUsed))
+                {
+                    return QuotaExceeded(probeUsed, config);
+                }
+
+                usageLedger.Release(userId, probeReserved);
+            }
+        }
+
+        var buffer = new byte[chunkLength];
         var filled = 0;
         try
         {
@@ -485,6 +522,7 @@ public class RippyUploadController : ControllerBase
         PruneChunkSessions();
         var session = ChunkSessions.GetOrAdd(key, _ => new ChunkSession());
         await session.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        long chunkReserved = 0;
         try
         {
             var incomingDirectory = Path.Combine(destination, IncomingDirectoryName);
@@ -536,6 +574,15 @@ public class RippyUploadController : ControllerBase
                 streamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
             }
 
+            // Binding quota check: everything this user has stored (finished files and every unfinished
+            // upload, this one included) plus this chunk must fit. The reservation covers the write itself,
+            // so parallel uploads under different ids cannot overshoot together.
+            var pending = PendingChunkBytes(incomingDirectory, userId, null, out _);
+            if (!usageLedger.TryReservePending(userId, destination, quotaBytes, pending, buffer.Length, out chunkReserved, out var usedNow))
+            {
+                return QuotaExceeded(usedNow, config);
+            }
+
             session.Length = -1;
             using (var fs = new FileStream(partPath, streamOptions))
             {
@@ -561,8 +608,68 @@ public class RippyUploadController : ControllerBase
         }
         finally
         {
+            if (chunkReserved > 0)
+            {
+                usageLedger.Release(userId, chunkReserved);
+            }
+
             session.Gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Sums the bytes a user holds in unfinished chunked uploads.
+    /// </summary>
+    /// <param name="incomingDirectory">The folder holding unfinished uploads.</param>
+    /// <param name="userId">The Jellyfin user ID.</param>
+    /// <param name="excludePath">An unfinished upload to leave out (one about to be restarted), or null.</param>
+    /// <param name="count">How many unfinished uploads were counted.</param>
+    /// <returns>Their total size in bytes.</returns>
+    private static long PendingChunkBytes(string incomingDirectory, Guid userId, string? excludePath, out int count)
+    {
+        count = 0;
+        long bytes = 0;
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var excluded = excludePath is null ? null : Path.GetFullPath(excludePath);
+        try
+        {
+            if (!Directory.Exists(incomingDirectory))
+            {
+                return 0;
+            }
+
+            foreach (var path in Directory.EnumerateFiles(incomingDirectory, userId.ToString("N") + "-*.part"))
+            {
+                if (excluded is not null && string.Equals(Path.GetFullPath(path), excluded, comparison))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    bytes += new FileInfo(path).Length;
+                    count++;
+                }
+                catch (IOException)
+                {
+                    // Finished or removed while counting.
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Count what could be read; the write itself will fail if the folder is unusable.
+        }
+
+        return bytes;
+    }
+
+    private ObjectResult QuotaExceeded(long usedBytes, PluginConfiguration config)
+    {
+        return Error(
+            StatusCodes.Status507InsufficientStorage,
+            "quota_exceeded",
+            "Upload quota exceeded: " + (usedBytes / 1048576) + " MB of " + config.UserQuotaMegabytes + " MB is in use, counting unfinished uploads. Ask an administrator to move or remove your files.");
     }
 
     /// <summary>
@@ -689,7 +796,8 @@ public class RippyUploadController : ControllerBase
             }
 
             var quotaBytes = config.UserQuotaMegabytes > 0 ? (long)config.UserQuotaMegabytes * 1024 * 1024 : 0;
-            if (!usage.TryReserve(userId, destination, quotaBytes, stored, out _, out reservedBytes, out var usedBytes))
+            var othersPending = quotaBytes > 0 ? PendingChunkBytes(Path.Combine(destination, IncomingDirectoryName), userId, partPath, out _) : 0;
+            if (!usage.TryReserve(userId, destination, quotaBytes, stored, out _, out reservedBytes, out var usedBytes, othersPending))
             {
                 return Error(
                     StatusCodes.Status507InsufficientStorage,

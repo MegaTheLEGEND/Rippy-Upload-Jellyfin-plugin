@@ -67,12 +67,13 @@ public sealed class UsageLedger
     /// <param name="allowance">The most bytes this upload may write.</param>
     /// <param name="reserved">The reservation to pass to <see cref="Release"/>.</param>
     /// <param name="used">Bytes the user already has in the upload directory.</param>
+    /// <param name="pendingBytes">Bytes the user holds in unfinished chunked uploads, counted as in use.</param>
     /// <returns>True when the upload may proceed.</returns>
-    public bool TryReserve(Guid user, string destination, long quotaBytes, long? contentLength, out long allowance, out long reserved, out long used)
+    public bool TryReserve(Guid user, string destination, long quotaBytes, long? contentLength, out long allowance, out long reserved, out long used, long pendingBytes = 0)
     {
         lock (_sync)
         {
-            used = SumAndPrune(destination, user).GetValueOrDefault(user);
+            used = SumAndPrune(destination, user).GetValueOrDefault(user) + Math.Max(0, pendingBytes);
             reserved = 0;
             if (quotaBytes <= 0)
             {
@@ -95,7 +96,43 @@ public sealed class UsageLedger
     }
 
     /// <summary>
-    /// Releases a reservation made by <see cref="TryReserve"/>.
+    /// Atomically checks the quota for part of a chunked upload and reserves space for it. Unlike
+    /// <see cref="TryReserve"/>, it also counts bytes the user already holds in unfinished chunked uploads,
+    /// so starting many uploads and never finishing them cannot get around the quota.
+    /// </summary>
+    /// <param name="user">The Jellyfin user ID.</param>
+    /// <param name="destination">The upload directory.</param>
+    /// <param name="quotaBytes">The quota in bytes; 0 or less means unlimited.</param>
+    /// <param name="pendingBytes">Bytes already stored in this user's unfinished chunked uploads.</param>
+    /// <param name="neededBytes">The bytes about to be written.</param>
+    /// <param name="reserved">The reservation to pass to <see cref="Release"/>.</param>
+    /// <param name="used">Bytes the user has in use, including unfinished uploads.</param>
+    /// <returns>True when the write may proceed.</returns>
+    public bool TryReservePending(Guid user, string destination, long quotaBytes, long pendingBytes, long neededBytes, out long reserved, out long used)
+    {
+        lock (_sync)
+        {
+            used = SumAndPrune(destination, user).GetValueOrDefault(user) + Math.Max(0, pendingBytes);
+            reserved = 0;
+            if (quotaBytes <= 0)
+            {
+                return true;
+            }
+
+            _reserved.TryGetValue(user, out var inFlight);
+            if (neededBytes > quotaBytes - used - inFlight)
+            {
+                return false;
+            }
+
+            reserved = Math.Max(0, neededBytes);
+            _reserved[user] = inFlight + reserved;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Releases a reservation made by <see cref="TryReserve"/> or <see cref="TryReservePending"/>.
     /// </summary>
     /// <param name="user">The Jellyfin user ID.</param>
     /// <param name="reserved">The reserved bytes.</param>
