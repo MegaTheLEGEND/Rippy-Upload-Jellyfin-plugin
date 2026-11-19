@@ -7,8 +7,13 @@ on:
         description: "Release version (e.g. 1.0.2 or 1.0.2.0)"
         required: true
         type: string
+      changelog:
+        description: "Changelog shown in Jellyfin's plugin catalog"
+        required: false
+        default: ""
+        type: string
       prerelease:
-        description: "Mark as pre-release"
+        description: "Mark as pre-release (not added to manifest.json, so servers do not auto-update to it)"
         required: false
         default: false
         type: boolean
@@ -60,7 +65,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 9.0.x
+          dotnet-version: 10.0.x
 
       - name: Build
         run: dotnet publish "$PROJECT" -c Release -o out
@@ -106,6 +111,28 @@ jobs:
             --generate-notes \
             $flags
 
+      - name: Add release to Jellyfin repository manifest
+        if: ${{ !inputs.prerelease }}
+        env:
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          full="${{ steps.ver.outputs.full }}"
+          tag="${{ steps.ver.outputs.tag }}"
+          url="https://github.com/${{ github.repository }}/releases/download/$tag/${{ steps.pkg.outputs.zip }}"
+          abi=$(jq -r '.targetAbi' meta.json)
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          changelog="${CHANGELOG:-See https://github.com/${{ github.repository }}/releases/tag/$tag}"
+          jq --arg v "$full" --arg c "$changelog" --arg abi "$abi" --arg url "$url" \
+             --arg md5 "${{ steps.pkg.outputs.md5 }}" --arg t "$now" \
+             '.[0].versions = ([{version: $v, changelog: $c, targetAbi: $abi, sourceUrl: $url, checksum: $md5, timestamp: $t}]
+                               + (.[0].versions | map(select(.version != $v))))' \
+             manifest.json > manifest.tmp
+          mv manifest.tmp manifest.json
+          jq '.[0].versions[0]' manifest.json
+          git add manifest.json
+          git commit -m "Add $tag to plugin repository manifest"
+          git push origin HEAD
+
       - name: Summary
         run: |
           {
@@ -114,4 +141,5 @@ jobs:
             echo "- Asset: \`${{ steps.pkg.outputs.zip }}\`"
             echo "- MD5 (for Jellyfin manifest): \`${{ steps.pkg.outputs.md5 }}\`"
             echo "- SHA256: \`${{ steps.pkg.outputs.sha256 }}\`"
+            echo "- Repository manifest: https://raw.githubusercontent.com/${{ github.repository }}/main/manifest.json"
           } >> "$GITHUB_STEP_SUMMARY"

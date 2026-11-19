@@ -2,15 +2,26 @@
 
 Receives MP4/MKV uploads from [Rippy](https://github.com/MegaTheLEGEND/Rippy) and saves them to an administrator-configured directory, then refreshes the Jellyfin library. Only Jellyfin users the administrator has explicitly allowed can upload.
 
-Targets Jellyfin **10.11.x** (.NET 9). For another server version, edit `JellyfinVersion` (and `TargetFramework` for Jellyfin 12+, which uses .NET 10) in `Jellyfin.Plugin.RippyUpload/Jellyfin.Plugin.RippyUpload.csproj` and `targetAbi` in `meta.json`.
+Targets Jellyfin **12.x** (.NET 10, built against 12.0.0 so it loads on any 12.x server). For Jellyfin 10.11.x, set `TargetFramework` to `net9.0` and `JellyfinVersion` to `10.11.10` in `Jellyfin.Plugin.RippyUpload/Jellyfin.Plugin.RippyUpload.csproj`, and `targetAbi` to `10.11.0.0` in `meta.json`.
 
-## Build and install
+## Install from the plugin repository (automatic updates)
+
+1. Dashboard → Plugins → **Repositories** (Catalog → ⚙ on some versions) → add:
+   - Name: `Rippy Upload`
+   - URL: `https://raw.githubusercontent.com/MegaTheLEGEND/Rippy-Upload-Jellyfin-plugin/main/manifest.json`
+2. Install **Rippy Upload** from the Catalog and restart Jellyfin.
+
+Jellyfin's scheduled task **Update Plugins** then installs new releases on its own; restart Jellyfin to load them. Automatic updates can be switched off per plugin on its page under My Plugins. A copy installed by hand has automatic updates off until it is switched on there or reinstalled from the Catalog.
+
+Releases are made with the **Release** GitHub Actions workflow (Actions → Release → Run workflow): it builds the zip, attaches it to a GitHub release and adds it to `manifest.json`. Pre-releases are not added to the manifest.
+
+## Build and install by hand
 
 ```bash
 dotnet publish Jellyfin.Plugin.RippyUpload -c Release -o out
 ```
 
-Copy `out/Jellyfin.Plugin.RippyUpload.dll` and `meta.json` into a new folder in the Jellyfin plugins directory, for example `<jellyfin-data>/plugins/RippyUpload_1.0.1.0/`, then restart Jellyfin.
+Copy `out/Jellyfin.Plugin.RippyUpload.dll` and `meta.json` into a new folder in the Jellyfin plugins directory, for example `<jellyfin-data>/plugins/RippyUpload_1.0.2.0/`, then restart Jellyfin.
 
 ## Configuration
 
